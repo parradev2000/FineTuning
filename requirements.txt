@@ -1,0 +1,11 @@
+flask==2.3.3
+torch==2.1.0
+transformers==4.35.0
+datasets==2.14.6
+peft==0.6.2
+accelerate==0.24.1
+bitsandbytes==0.41.1
+tokenizers==0.14.1
+sentencepiece==0.1.99
+python-docx==0.8.11
+PyPDF2==3.0.1
