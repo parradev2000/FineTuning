@@ -1,4 +1,3 @@
-```
 # Python
 __pycache__/
 *.pyc
@@ -68,4 +67,5 @@ fine_tuned_model/
 merged_model/
 exported_models/
 *.gguf
-```
+uploads/
+logs/

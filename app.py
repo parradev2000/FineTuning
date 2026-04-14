@@ -1,6 +1,7 @@
 from flask import Flask, request, render_template, jsonify, send_file
 import os
 import json
+import logging
 import threading
 import subprocess
 import shutil
@@ -11,9 +12,14 @@ from datasets import Dataset
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from document_processor import process_documents
 
+logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {'.txt', '.json', '.pdf', '.docx'}
+
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(32).hex())
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 # Asegurarse de que exista la carpeta de uploads
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -321,7 +327,7 @@ def index():
                 document.getElementById("exportProgressContainer").style.display = "block";
                 document.getElementById("exportStatus").textContent = "Iniciando exportacion...";
                 document.getElementById("exportStatus").className = "export-status";
-                document.getElementById("downloadArea").innerHTML = "";
+                document.getElementById("downloadArea").textContent = "";
                 
                 fetch("/export", {
                     method: "POST",
@@ -362,8 +368,13 @@ def index():
                             document.getElementById("exportBtn").disabled = false;
                             document.getElementById("exportBtn").textContent = "Exportar GGUF";
                             if (data.filename) {
-                                document.getElementById("downloadArea").innerHTML = 
-                                    '<a href="/download/' + data.filename + '" class="download-btn">Descargar ' + data.filename + '</a>';
+                                var dlArea = document.getElementById("downloadArea");
+                                dlArea.textContent = "";
+                                var dlLink = document.createElement("a");
+                                dlLink.href = "/download/" + encodeURIComponent(data.filename);
+                                dlLink.className = "download-btn";
+                                dlLink.textContent = "Descargar " + data.filename;
+                                dlArea.appendChild(dlLink);
                             }
                         } else if (data.state === "error") {
                             document.getElementById("exportStatus").className = "export-status error";
@@ -412,6 +423,13 @@ def upload_files():
     for file in files:
         if file and file.filename:
             filename = secure_filename(file.filename)
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Tipo de archivo no permitido: {ext}. '
+                               f'Formatos aceptados: {", ".join(ALLOWED_EXTENSIONS)}'
+                }), 400
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
             uploaded_files.append(filepath)
@@ -436,11 +454,12 @@ def upload_files():
             'training_samples': len(training_data)
         })
     except Exception as e:
+        logger.exception("Error during document processing")
         training_status['state'] = 'error'
-        training_status['message'] = f'Error durante el proceso: {str(e)}'
+        training_status['message'] = 'Error interno durante el procesamiento de documentos.'
         return jsonify({
             'status': 'error',
-            'message': f'Error durante el proceso: {str(e)}'
+            'message': 'Error interno del servidor durante el procesamiento.'
         }), 500
 
 
@@ -486,9 +505,10 @@ def chat():
             'model': inference_model_name
         })
     except Exception as e:
+        logger.exception("Error during chat generation")
         return jsonify({
             'status': 'error',
-            'message': f'Error durante la generacion: {str(e)}'
+            'message': 'Error interno durante la generacion de respuesta.'
         }), 500
 
 
@@ -638,8 +658,9 @@ def run_export(outtype):
         export_status['filename'] = gguf_filename
 
     except Exception as e:
+        logger.exception("Error during GGUF export")
         export_status['state'] = 'error'
-        export_status['message'] = f'Error durante la exportacion: {str(e)}'
+        export_status['message'] = 'Error interno durante la exportacion del modelo.'
         export_status['progress'] = 0
         # Cleanup on error
         shutil.rmtree(MERGED_MODEL_DIR, ignore_errors=True)
@@ -728,8 +749,9 @@ def run_fine_tuning(training_data):
         training_status['message'] = f'Fine-tuning completado. {result["training_samples"]} muestras procesadas.'
         training_status['progress'] = 100
     except Exception as e:
+        logger.exception("Error during model training")
         training_status['state'] = 'error'
-        training_status['message'] = f'Error durante el entrenamiento: {str(e)}'
+        training_status['message'] = 'Error interno durante el entrenamiento del modelo.'
 
 
 
@@ -847,4 +869,4 @@ def fine_tune_model(training_data):
     }
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true', host='0.0.0.0', port=5000)
