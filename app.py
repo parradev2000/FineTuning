@@ -1,7 +1,9 @@
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template, jsonify, send_file
 import os
 import json
 import threading
+import subprocess
+import shutil
 from werkzeug.utils import secure_filename
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
@@ -27,6 +29,25 @@ training_status = {
 inference_model = None
 inference_tokenizer = None
 inference_model_name = None
+
+# Estado de exportación GGUF
+export_status = {
+    'state': 'idle',  # idle, exporting, completed, error
+    'message': '',
+    'progress': 0,
+    'filename': None
+}
+
+# Rutas de exportación
+MERGED_MODEL_DIR = './merged_model'
+EXPORT_DIR = './exported_models'
+LLAMA_CPP_CONVERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'llama.cpp', 'convert_hf_to_gguf.py')
+# Fallback: check common locations for the convert script
+if not os.path.exists(LLAMA_CPP_CONVERT):
+    for path in ['/home/ubuntu/llama.cpp/convert_hf_to_gguf.py', os.path.expanduser('~/llama.cpp/convert_hf_to_gguf.py')]:
+        if os.path.exists(path):
+            LLAMA_CPP_CONVERT = path
+            break
 
 # Detectar si ya existe un modelo fine-tuned de una sesión anterior
 if os.path.exists('./fine_tuned_model/adapter_config.json'):
@@ -71,6 +92,23 @@ def index():
             .chat-input-area button { margin-left: 10px; white-space: nowrap; }
             .loading-dots::after { content: "."; animation: dots 1.5s steps(3, end) infinite; }
             @keyframes dots { 0% { content: "."; } 33% { content: ".."; } 66% { content: "..."; } }
+            .export-section { margin-top: 30px; display: none; border: 1px solid #dee2e6; border-radius: 4px; overflow: hidden; }
+            .export-header { background-color: #6f42c1; color: white; padding: 15px; }
+            .export-header h3 { margin: 0; }
+            .export-body { padding: 20px; background-color: #f8f9fa; }
+            .export-body p { margin-bottom: 15px; color: #555; }
+            .format-select { padding: 8px 12px; border: 1px solid #ced4da; border-radius: 4px; font-size: 14px; margin-right: 10px; }
+            .export-btn { background-color: #6f42c1; color: white; padding: 10px 20px; border: none; cursor: pointer; border-radius: 4px; font-size: 16px; }
+            .export-btn:hover { background-color: #5a32a3; }
+            .export-btn:disabled { background-color: #6c757d; cursor: not-allowed; }
+            .download-btn { background-color: #28a745; color: white; padding: 10px 20px; border: none; cursor: pointer; border-radius: 4px; font-size: 16px; text-decoration: none; display: inline-block; margin-top: 10px; }
+            .download-btn:hover { background-color: #218838; }
+            .export-progress-container { width: 100%; background-color: #e9ecef; border-radius: 4px; margin-top: 10px; height: 25px; display: none; }
+            .export-progress-bar { height: 25px; background-color: #6f42c1; border-radius: 4px; text-align: center; line-height: 25px; color: white; font-size: 14px; transition: width 0.5s ease; }
+            .export-status { margin-top: 10px; font-style: italic; color: #666; }
+            .export-status.error { color: #dc3545; }
+            .export-status.completed { color: #28a745; font-style: normal; font-weight: bold; }
+            .compatibility-info { margin-top: 15px; padding: 10px; background-color: #e7f1ff; border-radius: 4px; font-size: 13px; color: #0c5460; }
         </style>
     </head>
     <body>
@@ -104,6 +142,33 @@ def index():
                 <div class="chat-input-area">
                     <textarea id="chatInput" rows="2" placeholder="Escribe tu mensaje aqui..."></textarea>
                     <button id="chatSendBtn" onclick="sendChat()">Enviar</button>
+                </div>
+            </div>
+            
+            <div class="export-section" id="exportSection">
+                <div class="export-header">
+                    <h3>Exportar modelo en formato GGUF</h3>
+                </div>
+                <div class="export-body">
+                    <p>Descarga el modelo entrenado en formato GGUF para usar con LM Studio, Ollama o llama.cpp.</p>
+                    <div>
+                        <select id="exportFormat" class="format-select">
+                            <option value="f16">F16 (media precision, recomendado)</option>
+                            <option value="q8_0">Q8_0 (cuantizado 8-bit, mas pequeno)</option>
+                            <option value="f32">F32 (precision completa, mas grande)</option>
+                        </select>
+                        <button id="exportBtn" class="export-btn" onclick="startExport()">Exportar GGUF</button>
+                    </div>
+                    <div class="export-progress-container" id="exportProgressContainer">
+                        <div class="export-progress-bar" id="exportProgressBar">0%</div>
+                    </div>
+                    <div class="export-status" id="exportStatus"></div>
+                    <div id="downloadArea"></div>
+                    <div class="compatibility-info">
+                        <strong>Compatibilidad:</strong> El archivo GGUF es compatible con 
+                        <strong>LM Studio</strong>, <strong>Ollama</strong> (usa <code>ollama create</code>), 
+                        <strong>llama.cpp</strong>, <strong>GPT4All</strong> y otras herramientas locales.
+                    </div>
                 </div>
             </div>
         </div>
@@ -175,6 +240,7 @@ def index():
             
             function showChat() {
                 document.getElementById("chatSection").style.display = "block";
+                document.getElementById("exportSection").style.display = "block";
                 document.getElementById("chatSection").scrollIntoView({ behavior: "smooth" });
             }
             
@@ -246,6 +312,69 @@ def index():
                     sendChat();
                 }
             });
+            
+            function startExport() {
+                var fmt = document.getElementById("exportFormat").value;
+                var btn = document.getElementById("exportBtn");
+                btn.disabled = true;
+                btn.textContent = "Exportando...";
+                document.getElementById("exportProgressContainer").style.display = "block";
+                document.getElementById("exportStatus").textContent = "Iniciando exportacion...";
+                document.getElementById("exportStatus").className = "export-status";
+                document.getElementById("downloadArea").innerHTML = "";
+                
+                fetch("/export", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ format: fmt })
+                })
+                .then(function(response) { return response.json(); })
+                .then(function(data) {
+                    if (data.status === "started") {
+                        pollExportStatus();
+                    } else {
+                        document.getElementById("exportStatus").textContent = "Error: " + data.message;
+                        document.getElementById("exportStatus").className = "export-status error";
+                        btn.disabled = false;
+                        btn.textContent = "Exportar GGUF";
+                    }
+                })
+                .catch(function(err) {
+                    document.getElementById("exportStatus").textContent = "Error de conexion: " + err;
+                    document.getElementById("exportStatus").className = "export-status error";
+                    btn.disabled = false;
+                    btn.textContent = "Exportar GGUF";
+                });
+            }
+            
+            function pollExportStatus() {
+                fetch("/export/status")
+                    .then(function(response) { return response.json(); })
+                    .then(function(data) {
+                        var bar = document.getElementById("exportProgressBar");
+                        bar.style.width = data.progress + "%";
+                        bar.textContent = data.progress + "%";
+                        document.getElementById("exportStatus").textContent = data.message;
+                        
+                        if (data.state === "completed") {
+                            document.getElementById("exportStatus").className = "export-status completed";
+                            bar.style.backgroundColor = "#28a745";
+                            document.getElementById("exportBtn").disabled = false;
+                            document.getElementById("exportBtn").textContent = "Exportar GGUF";
+                            if (data.filename) {
+                                document.getElementById("downloadArea").innerHTML = 
+                                    '<a href="/download/' + data.filename + '" class="download-btn">Descargar ' + data.filename + '</a>';
+                            }
+                        } else if (data.state === "error") {
+                            document.getElementById("exportStatus").className = "export-status error";
+                            document.getElementById("exportBtn").disabled = false;
+                            document.getElementById("exportBtn").textContent = "Exportar GGUF";
+                        } else {
+                            setTimeout(pollExportStatus, 2000);
+                        }
+                    })
+                    .catch(function() { setTimeout(pollExportStatus, 3000); });
+            }
             
             // Check if model is already trained on page load
             fetch("/status")
@@ -361,6 +490,159 @@ def chat():
             'status': 'error',
             'message': f'Error durante la generacion: {str(e)}'
         }), 500
+
+
+@app.route('/export', methods=['POST'])
+def export_model():
+    """Inicia la exportación del modelo fine-tuned a formato GGUF"""
+    global export_status
+
+    if training_status['state'] != 'completed':
+        return jsonify({
+            'status': 'error',
+            'message': 'El modelo aun no ha sido entrenado.'
+        }), 400
+
+    if export_status['state'] == 'exporting':
+        return jsonify({
+            'status': 'error',
+            'message': 'Ya hay una exportacion en curso.'
+        }), 400
+
+    data = request.get_json() or {}
+    outtype = data.get('format', 'f16')
+    if outtype not in ('f32', 'f16', 'q8_0'):
+        outtype = 'f16'
+
+    export_status['state'] = 'exporting'
+    export_status['message'] = 'Iniciando exportacion...'
+    export_status['progress'] = 0
+    export_status['filename'] = None
+
+    thread = threading.Thread(target=run_export, args=(outtype,))
+    thread.start()
+
+    return jsonify({
+        'status': 'started',
+        'message': f'Exportacion iniciada en formato {outtype}'
+    })
+
+
+@app.route('/export/status')
+def get_export_status():
+    """Retorna el estado de la exportación GGUF"""
+    return jsonify(export_status)
+
+
+@app.route('/download/<filename>')
+def download_model(filename):
+    """Descarga el modelo exportado en formato GGUF"""
+    safe_name = secure_filename(filename)
+    filepath = os.path.join(EXPORT_DIR, safe_name)
+    if not os.path.exists(filepath):
+        return jsonify({'status': 'error', 'message': 'Archivo no encontrado'}), 404
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype='application/octet-stream'
+    )
+
+
+def run_export(outtype):
+    """Ejecuta la exportación en un hilo separado: merge LoRA + convert to GGUF"""
+    global export_status
+    try:
+        # Step 1: Merge LoRA adapters with base model
+        export_status['message'] = 'Cargando modelo base y adaptadores LoRA...'
+        export_status['progress'] = 10
+
+        adapter_path = './fine_tuned_model'
+
+        if torch.cuda.is_available():
+            base_model_name = "Qwen/Qwen2.5-7B-Instruct"
+            dtype = torch.float16
+            device_map = "auto"
+        else:
+            base_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+            dtype = torch.float32
+            device_map = None
+
+        load_kwargs = {"torch_dtype": dtype}
+        if device_map:
+            load_kwargs["device_map"] = device_map
+
+        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
+
+        export_status['message'] = 'Fusionando adaptadores LoRA con el modelo base...'
+        export_status['progress'] = 30
+
+        model = PeftModel.from_pretrained(base_model, adapter_path)
+        merged_model = model.merge_and_unload()
+
+        # Step 2: Save merged model
+        export_status['message'] = 'Guardando modelo fusionado...'
+        export_status['progress'] = 50
+
+        os.makedirs(MERGED_MODEL_DIR, exist_ok=True)
+        merged_model.save_pretrained(MERGED_MODEL_DIR, safe_serialization=True)
+        tokenizer.save_pretrained(MERGED_MODEL_DIR)
+
+        # Free memory
+        del merged_model, model, base_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Step 3: Convert to GGUF using llama.cpp
+        export_status['message'] = 'Convirtiendo a formato GGUF...'
+        export_status['progress'] = 70
+
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        gguf_filename = f'model-{outtype}.gguf'
+        gguf_path = os.path.join(EXPORT_DIR, gguf_filename)
+
+        if not os.path.exists(LLAMA_CPP_CONVERT):
+            raise FileNotFoundError(
+                f'No se encontro el script de conversion en {LLAMA_CPP_CONVERT}. '
+                'Instala llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git'
+            )
+
+        cmd = [
+            'python3', LLAMA_CPP_CONVERT,
+            MERGED_MODEL_DIR,
+            '--outfile', gguf_path,
+            '--outtype', outtype,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode != 0:
+            raise RuntimeError(f'Error en la conversion GGUF: {result.stderr[-500:] if result.stderr else "desconocido"}')
+
+        # Step 4: Cleanup merged model (keep only GGUF)
+        export_status['message'] = 'Limpiando archivos temporales...'
+        export_status['progress'] = 90
+
+        shutil.rmtree(MERGED_MODEL_DIR, ignore_errors=True)
+
+        # Get file size
+        file_size_mb = os.path.getsize(gguf_path) / (1024 * 1024)
+
+        export_status['state'] = 'completed'
+        export_status['message'] = f'Exportacion completada. Archivo: {gguf_filename} ({file_size_mb:.1f} MB)'
+        export_status['progress'] = 100
+        export_status['filename'] = gguf_filename
+
+    except Exception as e:
+        export_status['state'] = 'error'
+        export_status['message'] = f'Error durante la exportacion: {str(e)}'
+        export_status['progress'] = 0
+        # Cleanup on error
+        shutil.rmtree(MERGED_MODEL_DIR, ignore_errors=True)
 
 
 def load_inference_model():

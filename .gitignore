@@ -62,4 +62,10 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+
+# Model artifacts
+fine_tuned_model/
+merged_model/
+exported_models/
+*.gguf
 ```
